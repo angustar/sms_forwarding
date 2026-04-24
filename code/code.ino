@@ -15,10 +15,22 @@
 //wifi信息，需要你打开这个去改
 #include "wifi_config.h"
 
-//串口映射
-#define TXD 3
-#define RXD 4
-#define MODEM_EN_PIN 5
+// 模组1接线
+#define MODEM1_TXD 3
+#define MODEM1_RXD 4
+#define MODEM1_EN_PIN 5
+
+// 模组2接线
+#define MODEM2_TXD 1
+#define MODEM2_RXD 2
+#define MODEM2_EN_PIN 6
+
+#define MODEM_COUNT 2
+
+static_assert(MODEM1_EN_PIN == 5 && MODEM1_RXD == 4 && MODEM1_TXD == 3,
+              "模块1引脚映射被修改，请按接线图保持 GPIO5->EN GPIO4->TXD GPIO3->RXD");
+static_assert(MODEM2_EN_PIN == 6 && MODEM2_RXD == 2 && MODEM2_TXD == 1,
+              "模块2引脚映射被修改，请按接线图保持 GPIO6->EN GPIO2->TXD GPIO1->RXD");
 
 // LED引脚定义（用于通过CI验证，给个假的）
 #ifndef LED_BUILTIN
@@ -79,6 +91,11 @@ PDU pdu = PDU(4096);
 WiFiClientSecure ssl_client;
 SMTPClient smtp(ssl_client);
 WebServer server(80);
+HardwareSerial modem1(1);
+HardwareSerial modem2(0);
+
+const char* modemNames[MODEM_COUNT] = {"卡1", "卡2"};
+bool modemOnline[MODEM_COUNT] = {false, false};
 
 bool configValid = false;  // 配置是否有效
 bool timeSynced = false;   // NTP时间是否已同步
@@ -103,6 +120,7 @@ struct SmsPart {
 // 长短信缓存结构
 struct ConcatSms {
   bool inUse;                           // 是否正在使用
+  int modemSlot;                        // 来源卡槽(1/2)
   int refNumber;                        // 参考号
   String sender;                        // 发送者
   String timestamp;                     // 时间戳（使用第一个收到的分段的时间戳）
@@ -489,6 +507,13 @@ const char* htmlToolsPage = R"rawliteral(
       <div class="section">
         <div class="section-title">📤 发送短信</div>
         <div class="form-group">
+          <label>发送卡槽</label>
+          <select name="sim">
+            <option value="1">卡1</option>
+            <option value="2">卡2</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label>目标号码</label>
           <input type="text" name="phone" placeholder="13800138000" required>
         </div>
@@ -503,6 +528,13 @@ const char* htmlToolsPage = R"rawliteral(
     
     <div class="section">
       <div class="section-title">📊 模组信息查询</div>
+      <div class="form-group">
+        <label>查询卡槽</label>
+        <select id="querySim">
+          <option value="1">卡1</option>
+          <option value="2">卡2</option>
+        </select>
+      </div>
       <div class="btn-group">
         <button type="button" class="btn-query" onclick="queryInfo('ati')">📋 固件信息</button>
         <button type="button" class="btn-query" onclick="queryInfo('signal')">📶 信号质量</button>
@@ -519,6 +551,13 @@ const char* htmlToolsPage = R"rawliteral(
     
     <div class="section">
       <div class="section-title">🌐 网络测试</div>
+      <div class="form-group">
+        <label>测试卡槽</label>
+        <select id="pingSim">
+          <option value="1">卡1</option>
+          <option value="2">卡2</option>
+        </select>
+      </div>
       <button type="button" class="btn-ping" id="pingBtn" onclick="confirmPing()">📡 点我消耗一点流量</button>
       <div class="hint">将向 8.8.8.8 进行 ping 操作，一次性消耗极少流量费用</div>
       <div class="result-box" id="pingResult"></div>
@@ -526,6 +565,13 @@ const char* htmlToolsPage = R"rawliteral(
     
     <div class="section">
       <div class="section-title">✈️ 模组控制</div>
+      <div class="form-group">
+        <label>控制卡槽</label>
+        <select id="flightSim">
+          <option value="1">卡1</option>
+          <option value="2">卡2</option>
+        </select>
+      </div>
       <div class="btn-group">
         <button type="button" id="flightBtn" onclick="toggleFlightMode()" style="background:#E91E63;">✈️ 切换飞行模式</button>
         <button type="button" onclick="queryFlightMode()" style="background:#9C27B0;">🔍 查询状态</button>
@@ -536,6 +582,13 @@ const char* htmlToolsPage = R"rawliteral(
 
     <div class="section">
       <div class="section-title">💻 AT 指令调试</div>
+      <div class="form-group">
+        <label>调试卡槽</label>
+        <select id="atSim">
+          <option value="1">卡1</option>
+          <option value="2">卡2</option>
+        </select>
+      </div>
       <div id="atLog">等待输入指令...</div>
       <div class="at-input-group">
         <input type="text" id="atCmd" placeholder="输入 AT 指令，如: AT+CSQ">
@@ -553,12 +606,13 @@ const char* htmlToolsPage = R"rawliteral(
     }
     
     function queryInfo(type) {
+      var sim = document.getElementById('querySim').value;
       var result = document.getElementById('queryResult');
       result.className = 'result-box result-loading';
       result.style.display = 'block';
       result.textContent = '正在查询，请稍候...';
       
-      fetch('/query?type=' + type)
+      fetch('/query?type=' + type + '&sim=' + sim)
         .then(response => response.json())
         .then(data => {
           if (data.success) {
@@ -582,6 +636,7 @@ const char* htmlToolsPage = R"rawliteral(
     }
 
     function doPing() {
+      var sim = document.getElementById('pingSim').value;
       var btn = document.getElementById('pingBtn');
       var result = document.getElementById('pingResult');
       
@@ -591,7 +646,7 @@ const char* htmlToolsPage = R"rawliteral(
       result.style.display = 'block';
       result.textContent = '正在执行 Ping 操作，请稍候（最长等待30秒）...';
       
-      fetch('/ping', { method: 'POST' })
+      fetch('/ping?sim=' + sim, { method: 'POST' })
         .then(response => response.json())
         .then(data => {
           btn.disabled = false;
@@ -613,12 +668,13 @@ const char* htmlToolsPage = R"rawliteral(
     }
     
     function queryFlightMode() {
+      var sim = document.getElementById('flightSim').value;
       var result = document.getElementById('flightResult');
       result.className = 'result-box result-loading';
       result.style.display = 'block';
       result.textContent = '正在查询飞行模式状态...';
       
-      fetch('/flight?action=query')
+      fetch('/flight?action=query&sim=' + sim)
         .then(response => response.json())
         .then(data => {
           if (data.success) {
@@ -637,6 +693,7 @@ const char* htmlToolsPage = R"rawliteral(
     
     function toggleFlightMode() {
       if (!confirm('确定要切换飞行模式吗？\n\n开启飞行模式后模组将无法收发短信。')) return;
+      var sim = document.getElementById('flightSim').value;
       
       var btn = document.getElementById('flightBtn');
       var result = document.getElementById('flightResult');
@@ -645,7 +702,7 @@ const char* htmlToolsPage = R"rawliteral(
       result.style.display = 'block';
       result.textContent = '正在切换飞行模式...';
       
-      fetch('/flight?action=toggle')
+      fetch('/flight?action=toggle&sim=' + sim)
         .then(response => response.json())
         .then(data => {
           btn.disabled = false;
@@ -690,6 +747,7 @@ const char* htmlToolsPage = R"rawliteral(
 
     function sendAT() {
       var input = document.getElementById('atCmd');
+      var sim = document.getElementById('atSim').value;
       var cmd = input.value.trim();
       if (!cmd) return;
       
@@ -700,7 +758,7 @@ const char* htmlToolsPage = R"rawliteral(
       addLog(cmd, 'user');
       input.value = '';
       
-      fetch('/at?cmd=' + encodeURIComponent(cmd))
+      fetch('/at?cmd=' + encodeURIComponent(cmd) + '&sim=' + sim)
         .then(response => response.json())
         .then(data => {
           if (data.success) {
@@ -836,20 +894,48 @@ void handleToolsPage() {
   server.send(200, "text/html", html);
 }
 
+int normalizeModemSlot(int slot) {
+  if (slot < 1 || slot > MODEM_COUNT) return 1;
+  return slot;
+}
+
+HardwareSerial* getModemBySlot(int slot) {
+  slot = normalizeModemSlot(slot);
+  return slot == 1 ? &modem1 : &modem2;
+}
+
+bool isModemSlotOnline(int slot) {
+  slot = normalizeModemSlot(slot);
+  return modemOnline[slot - 1];
+}
+
+int getRequestedModemSlot() {
+  String simArg = server.arg("sim");
+  int slot = simArg.toInt();
+  if (slot == 0) slot = 1;
+  return normalizeModemSlot(slot);
+}
+
+String modemTag(int slot) {
+  slot = normalizeModemSlot(slot);
+  return String("[") + modemNames[slot - 1] + "]";
+}
+
 // 发送AT命令并获取响应
-String sendATCommand(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
+String sendATCommand(int modemSlot, const char* cmd, unsigned long timeout) {
+  HardwareSerial* modem = getModemBySlot(modemSlot);
+  while (modem->available()) modem->read();
+  modem->println(cmd);
   
   unsigned long start = millis();
   String resp = "";
   while (millis() - start < timeout) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
+    while (modem->available()) {
+      char c = modem->read();
       resp += c;
       if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
         delay(50);  // 等待剩余数据
-        while (Serial1.available()) resp += (char)Serial1.read();
+        while (modem->available()) resp += (char)modem->read();
         return resp;
       }
     }
@@ -861,15 +947,20 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
 void handleFlightMode() {
   if (!checkAuth()) return;
   
+  int modemSlot = getRequestedModemSlot();
   String action = server.arg("action");
-  String json = "{";
   bool success = false;
   String message = "";
+
+  if (!isModemSlotOnline(modemSlot)) {
+    server.send(200, "application/json", buildJsonResponse(false, modemTag(modemSlot) + " 模组离线，无法执行操作"));
+    return;
+  }
   
   if (action == "query") {
     // 查询当前功能模式
-    String resp = sendATCommand("AT+CFUN?", 2000);
-    Serial.println("CFUN查询响应: " + resp);
+    String resp = sendATCommand(modemSlot, "AT+CFUN?", 2000);
+    Serial.println(modemTag(modemSlot) + " CFUN查询响应: " + resp);
     
     if (resp.indexOf("+CFUN:") >= 0) {
       success = true;
@@ -893,6 +984,7 @@ void handleFlightMode() {
       }
       
       message = "<table class='info-table'>";
+      message += "<tr><td>卡槽</td><td>" + String(modemNames[modemSlot - 1]) + "</td></tr>";
       message += "<tr><td>当前状态</td><td>" + statusIcon + " " + modeStr + "</td></tr>";
       message += "<tr><td>CFUN值</td><td>" + String(mode) + "</td></tr>";
       message += "</table>";
@@ -902,8 +994,8 @@ void handleFlightMode() {
   }
   else if (action == "toggle") {
     // 先查询当前状态
-    String resp = sendATCommand("AT+CFUN?", 2000);
-    Serial.println("CFUN查询响应: " + resp);
+    String resp = sendATCommand(modemSlot, "AT+CFUN?", 2000);
+    Serial.println(modemTag(modemSlot) + " CFUN查询响应: " + resp);
     
     if (resp.indexOf("+CFUN:") >= 0) {
       int idx = resp.indexOf("+CFUN:");
@@ -913,9 +1005,9 @@ void handleFlightMode() {
       int newMode = (currentMode == 1) ? 4 : 1;
       String cmd = "AT+CFUN=" + String(newMode);
       
-      Serial.println("切换飞行模式: " + cmd);
-      String setResp = sendATCommand(cmd.c_str(), 5000);
-      Serial.println("CFUN设置响应: " + setResp);
+      Serial.println(modemTag(modemSlot) + " 切换飞行模式: " + cmd);
+      String setResp = sendATCommand(modemSlot, cmd.c_str(), 5000);
+      Serial.println(modemTag(modemSlot) + " CFUN设置响应: " + setResp);
       
       if (setResp.indexOf("OK") >= 0) {
         success = true;
@@ -933,7 +1025,7 @@ void handleFlightMode() {
   }
   else if (action == "on") {
     // 强制开启飞行模式
-    String resp = sendATCommand("AT+CFUN=4", 5000);
+    String resp = sendATCommand(modemSlot, "AT+CFUN=4", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
       message = "已开启飞行模式 ✈️";
@@ -943,7 +1035,7 @@ void handleFlightMode() {
   }
   else if (action == "off") {
     // 强制关闭飞行模式
-    String resp = sendATCommand("AT+CFUN=1", 5000);
+    String resp = sendATCommand(modemSlot, "AT+CFUN=1", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
       message = "已关闭飞行模式 🟢";
@@ -955,27 +1047,26 @@ void handleFlightMode() {
     message = "未知操作";
   }
   
-  json += "\"success\":" + String(success ? "true" : "false") + ",";
-  json += "\"message\":\"" + message + "\"";
-  json += "}";
-  
-  server.send(200, "application/json", json);
+  server.send(200, "application/json", buildJsonResponse(success, message));
 }
 
 // 处理AT指令测试请求
 void handleATCommand() {
   if (!checkAuth()) return;
   
+  int modemSlot = getRequestedModemSlot();
   String cmd = server.arg("cmd");
   bool success = false;
   String message = "";
   
-  if (cmd.length() == 0) {
+  if (!isModemSlotOnline(modemSlot)) {
+    message = modemTag(modemSlot) + " 模组离线";
+  } else if (cmd.length() == 0) {
     message = "错误：指令不能为空";
   } else {
-    Serial.println("网页端发送AT指令: " + cmd);
-    String resp = sendATCommand(cmd.c_str(), 5000);
-    Serial.println("模组响应: " + resp);
+    Serial.println(modemTag(modemSlot) + " 网页端发送AT指令: " + cmd);
+    String resp = sendATCommand(modemSlot, cmd.c_str(), 5000);
+    Serial.println(modemTag(modemSlot) + " 模组响应: " + resp);
     
     if (resp.length() > 0) {
       success = true;
@@ -985,27 +1076,27 @@ void handleATCommand() {
     }
   }
   
-  String json = "{";
-  json += "\"success\":" + String(success ? "true" : "false") + ",";
-  json += "\"message\":\"" + jsonEscape(message) + "\"";
-  json += "}";
-  
-  server.send(200, "application/json", json);
+  server.send(200, "application/json", buildJsonResponse(success, message));
 }
 
 // 处理模组信息查询请求
 void handleQuery() {
   if (!checkAuth()) return;
   
+  int modemSlot = getRequestedModemSlot();
   String type = server.arg("type");
-  String json = "{";
   bool success = false;
   String message = "";
+
+  if (!isModemSlotOnline(modemSlot) && type != "wifi") {
+    server.send(200, "application/json", buildJsonResponse(false, modemTag(modemSlot) + " 模组离线，无法查询"));
+    return;
+  }
   
   if (type == "ati") {
     // 固件信息查询
-    String resp = sendATCommand("ATI", 2000);
-    Serial.println("ATI响应: " + resp);
+    String resp = sendATCommand(modemSlot, "ATI", 2000);
+    Serial.println(modemTag(modemSlot) + " ATI响应: " + resp);
     
     if (resp.indexOf("OK") >= 0) {
       success = true;
@@ -1032,6 +1123,7 @@ void handleQuery() {
       }
       
       message = "<table class='info-table'>";
+      message += "<tr><td>卡槽</td><td>" + String(modemNames[modemSlot - 1]) + "</td></tr>";
       message += "<tr><td>制造商</td><td>" + manufacturer + "</td></tr>";
       message += "<tr><td>模组型号</td><td>" + model + "</td></tr>";
       message += "<tr><td>固件版本</td><td>" + version + "</td></tr>";
@@ -1042,8 +1134,8 @@ void handleQuery() {
   }
   else if (type == "signal") {
     // 信号质量查询
-    String resp = sendATCommand("AT+CESQ", 2000);
-    Serial.println("CESQ响应: " + resp);
+    String resp = sendATCommand(modemSlot, "AT+CESQ", 2000);
+    Serial.println(modemTag(modemSlot) + " CESQ响应: " + resp);
     
     if (resp.indexOf("+CESQ:") >= 0) {
       success = true;
@@ -1094,6 +1186,7 @@ void handleQuery() {
       }
       
       message = "<table class='info-table'>";
+      message += "<tr><td>卡槽</td><td>" + String(modemNames[modemSlot - 1]) + "</td></tr>";
       message += "<tr><td>信号强度 (RSRP)</td><td>" + rsrpStr + "</td></tr>";
       message += "<tr><td>信号质量 (RSRQ)</td><td>" + rsrqStr + "</td></tr>";
       message += "<tr><td>原始数据</td><td>" + params + "</td></tr>";
@@ -1106,9 +1199,10 @@ void handleQuery() {
     // SIM卡信息查询
     success = true;
     message = "<table class='info-table'>";
+    message += "<tr><td>卡槽</td><td>" + String(modemNames[modemSlot - 1]) + "</td></tr>";
     
     // 查询IMSI
-    String resp = sendATCommand("AT+CIMI", 2000);
+    String resp = sendATCommand(modemSlot, "AT+CIMI", 2000);
     String imsi = "未知";
     if (resp.indexOf("OK") >= 0) {
       int start = resp.indexOf('\n');
@@ -1125,7 +1219,7 @@ void handleQuery() {
     message += "<tr><td>IMSI</td><td>" + imsi + "</td></tr>";
     
     // 查询ICCID
-    resp = sendATCommand("AT+ICCID", 2000);
+    resp = sendATCommand(modemSlot, "AT+ICCID", 2000);
     String iccid = "未知";
     if (resp.indexOf("+ICCID:") >= 0) {
       int idx = resp.indexOf("+ICCID:");
@@ -1138,7 +1232,7 @@ void handleQuery() {
     message += "<tr><td>ICCID</td><td>" + iccid + "</td></tr>";
     
     // 查询本机号码 (如果SIM卡支持)
-    resp = sendATCommand("AT+CNUM", 2000);
+    resp = sendATCommand(modemSlot, "AT+CNUM", 2000);
     String phoneNum = "未存储或不支持";
     if (resp.indexOf("+CNUM:") >= 0) {
       int idx = resp.indexOf(",\"");
@@ -1157,9 +1251,10 @@ void handleQuery() {
     // 网络状态查询
     success = true;
     message = "<table class='info-table'>";
+    message += "<tr><td>卡槽</td><td>" + String(modemNames[modemSlot - 1]) + "</td></tr>";
     
     // 查询网络注册状态
-    String resp = sendATCommand("AT+CEREG?", 2000);
+    String resp = sendATCommand(modemSlot, "AT+CEREG?", 2000);
     String regStatus = "未知";
     if (resp.indexOf("+CEREG:") >= 0) {
       int idx = resp.indexOf("+CEREG:");
@@ -1182,7 +1277,7 @@ void handleQuery() {
     message += "<tr><td>网络注册</td><td>" + regStatus + "</td></tr>";
     
     // 查询运营商
-    resp = sendATCommand("AT+COPS?", 2000);
+    resp = sendATCommand(modemSlot, "AT+COPS?", 2000);
     String oper = "未知";
     if (resp.indexOf("+COPS:") >= 0) {
       int idx = resp.indexOf(",\"");
@@ -1196,7 +1291,7 @@ void handleQuery() {
     message += "<tr><td>运营商</td><td>" + oper + "</td></tr>";
     
     // 查询PDP上下文激活状态
-    resp = sendATCommand("AT+CGACT?", 2000);
+    resp = sendATCommand(modemSlot, "AT+CGACT?", 2000);
     String pdpStatus = "未激活";
     if (resp.indexOf("+CGACT: 1,1") >= 0) {
       pdpStatus = "已激活";
@@ -1206,7 +1301,7 @@ void handleQuery() {
     message += "<tr><td>数据连接</td><td>" + pdpStatus + "</td></tr>";
     
     // 查询APN
-    resp = sendATCommand("AT+CGDCONT?", 2000);
+    resp = sendATCommand(modemSlot, "AT+CGDCONT?", 2000);
     String apn = "未知";
     if (resp.indexOf("+CGDCONT:") >= 0) {
       int idx = resp.indexOf(",\"");
@@ -1229,6 +1324,12 @@ void handleQuery() {
     // WiFi状态查询
     success = true;
     message = "<table class='info-table'>";
+    message += "<tr><td>卡槽状态</td><td>";
+    for (int i = 0; i < MODEM_COUNT; i++) {
+      message += String(modemNames[i]) + ":" + (modemOnline[i] ? "在线" : "离线");
+      if (i < MODEM_COUNT - 1) message += " | ";
+    }
+    message += "</td></tr>";
     
     // WiFi连接状态
     String wifiStatus = WiFi.isConnected() ? "已连接" : "未连接";
@@ -1277,21 +1378,18 @@ void handleQuery() {
     message = "未知的查询类型";
   }
   
-  json += "\"success\":" + String(success ? "true" : "false") + ",";
-  json += "\"message\":\"" + message + "\"";
-  json += "}";
-  
-  server.send(200, "application/json", json);
+  server.send(200, "application/json", buildJsonResponse(success, message));
 }
 
 // 前置声明
 void sendEmailNotification(const char* subject, const char* body);
-bool sendSMS(const char* phoneNumber, const char* message);
+bool sendSMS(int modemSlot, const char* phoneNumber, const char* message);
 
 // 处理发送短信请求
 void handleSendSms() {
   if (!checkAuth()) return;
   
+  int modemSlot = getRequestedModemSlot();
   String phone = server.arg("phone");
   String content = server.arg("content");
   
@@ -1301,17 +1399,19 @@ void handleSendSms() {
   bool success = false;
   String resultMsg = "";
   
-  if (phone.length() == 0) {
+  if (!isModemSlotOnline(modemSlot)) {
+    resultMsg = modemTag(modemSlot) + " 模组离线，无法发送";
+  } else if (phone.length() == 0) {
     resultMsg = "错误：请输入目标号码";
   } else if (content.length() == 0) {
     resultMsg = "错误：请输入短信内容";
   } else {
-    Serial.println("网页端发送短信请求");
+    Serial.println(modemTag(modemSlot) + " 网页端发送短信请求");
     Serial.println("目标号码: " + phone);
     Serial.println("短信内容: " + content);
     
-    success = sendSMS(phone.c_str(), content.c_str());
-    resultMsg = success ? "短信发送成功！" : "短信发送失败，请检查模组状态";
+    success = sendSMS(modemSlot, phone.c_str(), content.c_str());
+    resultMsg = success ? (modemTag(modemSlot) + " 短信发送成功！") : (modemTag(modemSlot) + " 短信发送失败，请检查模组状态");
   }
   
   String html = R"rawliteral(
@@ -1348,15 +1448,23 @@ void handleSendSms() {
 void handlePing() {
   if (!checkAuth()) return;
   
-  Serial.println("网页端发起Ping请求");
+  int modemSlot = getRequestedModemSlot();
+  Serial.println(modemTag(modemSlot) + " 网页端发起Ping请求");
+
+  if (!isModemSlotOnline(modemSlot)) {
+    server.send(200, "application/json", buildJsonResponse(false, "模组离线，无法执行Ping"));
+    return;
+  }
+
+  HardwareSerial* modem = getModemBySlot(modemSlot);
   
   // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
+  while (modem->available()) modem->read();
   
   // 激活PDP上下文（数据连接）
   Serial.println("激活数据连接(CGACT)...");
-  String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
-  Serial.println("CGACT响应: " + activateResp);
+  String activateResp = sendATCommand(modemSlot, "AT+CGACT=1,1", 10000);
+  Serial.println(modemTag(modemSlot) + " CGACT响应: " + activateResp);
   
   // 检查激活是否成功（OK或已激活的情况）
   bool networkActivated = (activateResp.indexOf("OK") >= 0);
@@ -1365,11 +1473,11 @@ void handlePing() {
   }
   
   // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
+  while (modem->available()) modem->read();
   delay(500);  // 等待网络稳定
   
   // 发送MPING命令，ping 8.8.8.8，超时30秒，ping 1次
-  Serial1.println("AT+MPING=\"8.8.8.8\",30,1");
+  modem->println("AT+MPING=\"8.8.8.8\",30,1");
   
   // 等待响应
   unsigned long start = millis();
@@ -1381,8 +1489,8 @@ void handlePing() {
   
   // 等待最多35秒（30秒超时 + 5秒余量）
   while (millis() - start < 35000) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
+    while (modem->available()) {
+      char c = modem->read();
       resp += c;
       Serial.print(c);  // 调试输出
       
@@ -1499,27 +1607,24 @@ void handlePing() {
   
   // 关闭数据连接以节省流量
   Serial.println("关闭PDP上下文(CGACT=0)...");
-  String deactivateResp = sendATCommand("AT+CGACT=0,1", 5000);
-  Serial.println("CGACT关闭响应: " + deactivateResp);
+  String deactivateResp = sendATCommand(modemSlot, "AT+CGACT=0,1", 5000);
+  Serial.println(modemTag(modemSlot) + " CGACT关闭响应: " + deactivateResp);
   
   // 构建JSON响应
-  String json = "{";
+  String message = "";
+  bool success = false;
   if (gotPingResult && pingResultMsg.indexOf("延迟") >= 0) {
-    json += "\"success\":true,";
-    json += "\"message\":\"" + pingResultMsg + "\"";
+    success = true;
+    message = pingResultMsg;
   } else if (gotError) {
-    json += "\"success\":false,";
-    json += "\"message\":\"" + pingResultMsg + "\"";
+    message = pingResultMsg;
   } else if (gotPingResult) {
-    json += "\"success\":false,";
-    json += "\"message\":\"" + pingResultMsg + "\"";
+    message = pingResultMsg;
   } else {
-    json += "\"success\":false,";
-    json += "\"message\":\"操作超时，未收到Ping结果\"";
+    message = "操作超时，未收到Ping结果";
   }
-  json += "}";
-  
-  server.send(200, "application/json", json);
+
+  server.send(200, "application/json", buildJsonResponse(success, message));
 }
 
 // 处理保存配置请求
@@ -1626,8 +1731,9 @@ void sendEmailNotification(const char* subject, const char* body) {
 }
 
 // 发送短信（PDU模式）
-bool sendSMS(const char* phoneNumber, const char* message) {
-  Serial.println("准备发送短信...");
+bool sendSMS(int modemSlot, const char* phoneNumber, const char* message) {
+  HardwareSerial* modem = getModemBySlot(modemSlot);
+  Serial.println(modemTag(modemSlot) + " 准备发送短信...");
   Serial.print("目标号码: "); Serial.println(phoneNumber);
   Serial.print("短信内容: "); Serial.println(message);
 
@@ -1648,15 +1754,15 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   String cmgsCmd = "AT+CMGS=";
   cmgsCmd += pduLen;
   
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmgsCmd);
+  while (modem->available()) modem->read();
+  modem->println(cmgsCmd);
   
   // 等待 > 提示符
   unsigned long start = millis();
   bool gotPrompt = false;
   while (millis() - start < 5000) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
+    if (modem->available()) {
+      char c = modem->read();
       Serial.print(c);
       if (c == '>') {
         gotPrompt = true;
@@ -1671,15 +1777,15 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   }
   
   // 发送PDU数据
-  Serial1.print(pdu.getSMS());
-  Serial1.write(0x1A);  // Ctrl+Z 结束
+  modem->print(pdu.getSMS());
+  modem->write(0x1A);  // Ctrl+Z 结束
   
   // 等待响应
   start = millis();
   String resp = "";
   while (millis() - start < 30000) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
+    while (modem->available()) {
+      char c = modem->read();
       resp += c;
       Serial.print(c);
       if (resp.indexOf("OK") >= 0) {
@@ -1697,40 +1803,43 @@ bool sendSMS(const char* phoneNumber, const char* message) {
 }
 
 // 新增“模组断电重启”函数
-void modemPowerCycle() {
-  pinMode(MODEM_EN_PIN, OUTPUT);
+void modemPowerCycle(int modemSlot) {
+  int enPin = normalizeModemSlot(modemSlot) == 1 ? MODEM1_EN_PIN : MODEM2_EN_PIN;
+  pinMode(enPin, OUTPUT);
 
-  Serial.println("EN 拉低：关闭模组");
-  digitalWrite(MODEM_EN_PIN, LOW);
+  Serial.println(modemTag(modemSlot) + " EN 拉低：关闭模组");
+  digitalWrite(enPin, LOW);
   delay(1200);  // 关机时间给够
 
-  Serial.println("EN 拉高：开启模组");
-  digitalWrite(MODEM_EN_PIN, HIGH);
+  Serial.println(modemTag(modemSlot) + " EN 拉高：开启模组");
+  digitalWrite(enPin, HIGH);
   delay(6000);  // 等模组完全启动再发AT（关键）
 }
 
 
 // 重启模组
-void resetModule() {
-  Serial.println("正在硬重启模组（EN 断电重启）...");
+void resetModule(int modemSlot) {
+  HardwareSerial* modem = getModemBySlot(modemSlot);
+  Serial.println(modemTag(modemSlot) + " 正在硬重启模组（EN 断电重启）...");
 
-  modemPowerCycle();
+  modemPowerCycle(modemSlot);
 
   // 清掉上电噪声/残留
-  while (Serial1.available()) Serial1.read();
+  while (modem->available()) modem->read();
 
   // 硬重启后做 AT 握手确认（最多等 10 秒）
   bool ok = false;
   for (int i = 0; i < 10; i++) {
-    if (sendATandWaitOK("AT", 1000)) {
+    if (sendATandWaitOK(modemSlot, "AT", 1000)) {
       ok = true;
       break;
     }
-    Serial.println("AT未响应，继续等模组启动...");
+    Serial.println(modemTag(modemSlot) + " AT未响应，继续等模组启动...");
   }
 
-  if (ok) Serial.println("模组AT恢复正常");
-  else    Serial.println("模组AT仍未响应（检查EN接线/供电/波特率）");
+  modemOnline[normalizeModemSlot(modemSlot) - 1] = ok;
+  if (ok) Serial.println(modemTag(modemSlot) + " 模组AT恢复正常");
+  else    Serial.println(modemTag(modemSlot) + " 模组AT仍未响应（检查EN接线/供电/波特率）");
 }
 
 
@@ -1782,7 +1891,7 @@ bool isAdmin(const char* sender) {
 }
 
 // 处理管理员命令
-void processAdminCommand(const char* sender, const char* text) {
+void processAdminCommand(int modemSlot, const char* sender, const char* text) {
   String cmd = String(text);
   cmd.trim();
   
@@ -1803,7 +1912,7 @@ void processAdminCommand(const char* sender, const char* text) {
       Serial.println("目标号码: " + targetPhone);
       Serial.println("短信内容: " + smsContent);
       
-      bool success = sendSMS(targetPhone.c_str(), smsContent.c_str());
+      bool success = sendSMS(modemSlot, targetPhone.c_str(), smsContent.c_str());
       
       // 发送邮件通知结果
       String subject = success ? "短信发送成功" : "短信发送失败";
@@ -1826,8 +1935,10 @@ void processAdminCommand(const char* sender, const char* text) {
     // 先发送邮件通知（因为重启后就发不了了）
     sendEmailNotification("重启命令已执行", "收到RESET命令，即将重启模组和ESP32...");
     
-    // 重启模组
-    resetModule();
+    // 重启全部模组
+    for (int i = 1; i <= MODEM_COUNT; i++) {
+      resetModule(i);
+    }
     
     // 重启ESP32
     Serial.println("正在重启ESP32...");
@@ -1843,6 +1954,7 @@ void processAdminCommand(const char* sender, const char* text) {
 void initConcatBuffer() {
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     concatBuffer[i].inUse = false;
+    concatBuffer[i].modemSlot = 0;
     concatBuffer[i].receivedParts = 0;
     for (int j = 0; j < MAX_CONCAT_PARTS; j++) {
       concatBuffer[i].parts[j].valid = false;
@@ -1852,10 +1964,11 @@ void initConcatBuffer() {
 }
 
 // 查找或创建长短信缓存槽位
-int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
+int findOrCreateConcatSlot(int modemSlot, int refNumber, const char* sender, int totalParts) {
   // 先查找是否已存在
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
-    if (concatBuffer[i].inUse && 
+    if (concatBuffer[i].inUse &&
+      concatBuffer[i].modemSlot == modemSlot &&
         concatBuffer[i].refNumber == refNumber &&
         concatBuffer[i].sender.equals(sender)) {
       return i;
@@ -1866,6 +1979,7 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (!concatBuffer[i].inUse) {
       concatBuffer[i].inUse = true;
+      concatBuffer[i].modemSlot = modemSlot;
       concatBuffer[i].refNumber = refNumber;
       concatBuffer[i].sender = String(sender);
       concatBuffer[i].totalParts = totalParts;
@@ -1892,6 +2006,7 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
   // 覆盖最老的槽位
   Serial.println("⚠️ 长短信缓存已满，覆盖最老的槽位");
   concatBuffer[oldestSlot].inUse = true;
+  concatBuffer[oldestSlot].modemSlot = modemSlot;
   concatBuffer[oldestSlot].refNumber = refNumber;
   concatBuffer[oldestSlot].sender = String(sender);
   concatBuffer[oldestSlot].totalParts = totalParts;
@@ -1920,6 +2035,7 @@ String assembleConcatSms(int slot) {
 // 清空长短信槽位
 void clearConcatSlot(int slot) {
   concatBuffer[slot].inUse = false;
+  concatBuffer[slot].modemSlot = 0;
   concatBuffer[slot].receivedParts = 0;
   concatBuffer[slot].sender = "";
   concatBuffer[slot].timestamp = "";
@@ -1930,7 +2046,7 @@ void clearConcatSlot(int slot) {
 }
 
 // 前置声明
-void processSmsContent(const char* sender, const char* text, const char* timestamp);
+void processSmsContent(int modemSlot, const char* sender, const char* text, const char* timestamp);
 
 // 检查长短信超时并转发
 void checkConcatTimeout() {
@@ -1948,7 +2064,8 @@ void checkConcatTimeout() {
         String fullText = assembleConcatSms(i);
         
         // 处理短信内容
-        processSmsContent(concatBuffer[i].sender.c_str(), 
+        processSmsContent(concatBuffer[i].modemSlot,
+             concatBuffer[i].sender.c_str(), 
                          fullText.c_str(), 
                          concatBuffer[i].timestamp.c_str());
         
@@ -2026,6 +2143,14 @@ String jsonEscape(const String& str) {
     else result += c;
   }
   return result;
+}
+
+String buildJsonResponse(bool success, const String& message) {
+  String json = "{";
+  json += "\"success\":" + String(success ? "true" : "false") + ",";
+  json += "\"message\":\"" + jsonEscape(message) + "\"";
+  json += "}";
+  return json;
 }
 
 // 发送单个推送通道
@@ -2303,22 +2428,23 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
 }
 
 // 读取串口一行（含回车换行），返回行字符串，无新行时返回空
-String readSerialLine(HardwareSerial& port) {
-  static char lineBuf[SERIAL_BUFFER_SIZE];
-  static int linePos = 0;
+String readSerialLine(HardwareSerial& port, int modemSlot) {
+  static char lineBuf[MODEM_COUNT][SERIAL_BUFFER_SIZE];
+  static int linePos[MODEM_COUNT] = {0, 0};
+  int idx = normalizeModemSlot(modemSlot) - 1;
 
   while (port.available()) {
     char c = port.read();
     if (c == '\n') {
-      lineBuf[linePos] = 0;
-      String res = String(lineBuf);
-      linePos = 0;
+      lineBuf[idx][linePos[idx]] = 0;
+      String res = String(lineBuf[idx]);
+      linePos[idx] = 0;
       return res;
     } else if (c != '\r') {  // 跳过\r
-      if (linePos < SERIAL_BUFFER_SIZE - 1)
-        lineBuf[linePos++] = c;
+      if (linePos[idx] < SERIAL_BUFFER_SIZE - 1)
+        lineBuf[idx][linePos[idx]++] = c;
       else
-        linePos = 0;  //超长报错保护，重头计
+        linePos[idx] = 0;  //超长报错保护，重头计
     }
   }
   return "";
@@ -2337,8 +2463,9 @@ bool isHexString(const String& str) {
 }
 
 // 处理最终的短信内容（管理员命令检查和转发）
-void processSmsContent(const char* sender, const char* text, const char* timestamp) {
+void processSmsContent(int modemSlot, const char* sender, const char* text, const char* timestamp) {
   Serial.println("=== 处理短信内容 ===");
+  Serial.println("来源卡槽: " + String(modemNames[normalizeModemSlot(modemSlot) - 1]));
   Serial.println("发送者: " + String(sender));
   Serial.println("时间戳: " + String(timestamp));
   Serial.println("内容: " + String(text));
@@ -2358,38 +2485,46 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
     
     // 检查是否为命令格式
     if (smsText.startsWith("SMS:") || smsText.equals("RESET")) {
-      processAdminCommand(sender, text);
+      processAdminCommand(modemSlot, sender, text);
       // 命令已处理，不再发送普通通知邮件
       return;
     }
   }
 
+  String taggedText = modemTag(modemSlot) + " " + String(text);
+
   // 发送通知http（推送到所有启用的通道）
-  sendSMSToServer(sender, text, timestamp);
+  sendSMSToServer(sender, taggedText.c_str(), timestamp);
   // 发送通知邮件
-  String subject = ""; subject+="短信";subject+=sender;subject+=",";subject+=text;
-  String body = ""; body+="来自：";body+=sender;body+="，时间：";body+=timestamp;body+="，内容：";body+=text;
+  String subject = ""; subject+="短信";subject+=sender;subject+="(";subject+=modemNames[normalizeModemSlot(modemSlot) - 1];subject+=")";
+  String body = ""; body+="卡槽：";body+=modemNames[normalizeModemSlot(modemSlot) - 1];body+="，来自：";body+=sender;body+="，时间：";body+=timestamp;body+="，内容：";body+=text;
   sendEmailNotification(subject.c_str(), body.c_str());
 }
 
 // 处理URC和PDU
-void checkSerial1URC() {
-  static enum { IDLE,
-                WAIT_PDU } state = IDLE;
+void checkModemURC(int modemSlot) {
+  static int states[MODEM_COUNT] = {0, 0};
+  int slot = normalizeModemSlot(modemSlot);
+  HardwareSerial* modem = getModemBySlot(slot);
 
-  String line = readSerialLine(Serial1);
+  enum {
+    IDLE,
+    WAIT_PDU
+  };
+
+  String line = readSerialLine(*modem, slot);
   if (line.length() == 0) return;
 
   // 打印到调试串口
-  Serial.println("Debug> " + line);
+  Serial.println(modemTag(slot) + " Debug> " + line);
 
-  if (state == IDLE) {
+  if (states[slot - 1] == IDLE) {
     // 检测到短信上报URC头
     if (line.startsWith("+CMT:")) {
-      Serial.println("检测到+CMT，等待PDU数据...");
-      state = WAIT_PDU;
+      Serial.println(modemTag(slot) + " 检测到+CMT，等待PDU数据...");
+      states[slot - 1] = WAIT_PDU;
     }
-  } else if (state == WAIT_PDU) {
+  } else if (states[slot - 1] == WAIT_PDU) {
     // 跳过空行
     if (line.length() == 0) {
       return;
@@ -2425,24 +2560,24 @@ void checkSerial1URC() {
           Serial.printf("📧 收到长短信分段 %d/%d\n", partNumber, totalParts);
           
           // 查找或创建缓存槽位
-          int slot = findOrCreateConcatSlot(refNumber, pdu.getSender(), totalParts);
+          int concatSlot = findOrCreateConcatSlot(slot, refNumber, pdu.getSender(), totalParts);
           
           // 存储该分段（partNumber从1开始，数组从0开始）
           int partIndex = partNumber - 1;
           if (partIndex >= 0 && partIndex < MAX_CONCAT_PARTS) {
-            if (!concatBuffer[slot].parts[partIndex].valid) {
-              concatBuffer[slot].parts[partIndex].valid = true;
-              concatBuffer[slot].parts[partIndex].text = String(pdu.getText());
-              concatBuffer[slot].receivedParts++;
+            if (!concatBuffer[concatSlot].parts[partIndex].valid) {
+              concatBuffer[concatSlot].parts[partIndex].valid = true;
+              concatBuffer[concatSlot].parts[partIndex].text = String(pdu.getText());
+              concatBuffer[concatSlot].receivedParts++;
               
               // 如果是第一个收到的分段，保存时间戳
-              if (concatBuffer[slot].receivedParts == 1) {
-                concatBuffer[slot].timestamp = String(pdu.getTimeStamp());
+              if (concatBuffer[concatSlot].receivedParts == 1) {
+                concatBuffer[concatSlot].timestamp = String(pdu.getTimeStamp());
               }
               
               Serial.printf("  已缓存分段 %d，当前已收到 %d/%d\n", 
                            partNumber, 
-                           concatBuffer[slot].receivedParts, 
+                           concatBuffer[concatSlot].receivedParts, 
                            totalParts);
             } else {
               Serial.printf("  ⚠️ 分段 %d 已存在，跳过\n", partNumber);
@@ -2450,33 +2585,34 @@ void checkSerial1URC() {
           }
           
           // 检查是否已收齐所有分段
-          if (concatBuffer[slot].receivedParts >= totalParts) {
+          if (concatBuffer[concatSlot].receivedParts >= totalParts) {
             Serial.println("✅ 长短信已收齐，开始合并转发");
             
             // 合并所有分段
-            String fullText = assembleConcatSms(slot);
+            String fullText = assembleConcatSms(concatSlot);
             
             // 处理完整短信
-            processSmsContent(concatBuffer[slot].sender.c_str(), 
+            processSmsContent(slot,
+                             concatBuffer[concatSlot].sender.c_str(), 
                              fullText.c_str(), 
-                             concatBuffer[slot].timestamp.c_str());
+                             concatBuffer[concatSlot].timestamp.c_str());
             
             // 清空槽位
-            clearConcatSlot(slot);
+            clearConcatSlot(concatSlot);
           }
         } else {
           // 普通短信，直接处理
-          processSmsContent(pdu.getSender(), pdu.getText(), pdu.getTimeStamp());
+          processSmsContent(slot, pdu.getSender(), pdu.getText(), pdu.getTimeStamp());
         }
       }
       
       // 返回IDLE状态
-      state = IDLE;
+      states[slot - 1] = IDLE;
     } 
     // 如果是其他内容（OK、ERROR等），也返回IDLE
     else {
       Serial.println("收到非PDU数据，返回IDLE状态");
-      state = IDLE;
+      states[slot - 1] = IDLE;
     }
   }
 }
@@ -2488,14 +2624,15 @@ void blink_short(unsigned long gap_time = 500) {
   delay(gap_time);
 }
 
-bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
+bool sendATandWaitOK(int modemSlot, const char* cmd, unsigned long timeout) {
+  HardwareSerial* modem = getModemBySlot(modemSlot);
+  while (modem->available()) modem->read();
+  modem->println(cmd);
   unsigned long start = millis();
   String resp = "";
   while (millis() - start < timeout) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
+    while (modem->available()) {
+      char c = modem->read();
       resp += c;
       if (resp.indexOf("OK") >= 0) return true;
       if (resp.indexOf("ERROR") >= 0) return false;
@@ -2506,22 +2643,15 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
 
 // 检测网络注册状态（LTE/4G）
 // CEREG状态: 1=已注册本地, 5=已注册漫游
-bool waitCEREG() {
-  Serial1.println("AT+CEREG?");
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < 2000) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      resp += c;
-      // +CEREG: <n>,<stat> 其中stat=1或5表示已注册
-      if (resp.indexOf("+CEREG:") >= 0) {
-        // 检查是否已注册（状态1或5）
-        if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) return true;
-        if (resp.indexOf(",0") >= 0 || resp.indexOf(",2") >= 0 || 
-            resp.indexOf(",3") >= 0 || resp.indexOf(",4") >= 0) return false;
-      }
+bool waitCEREG(int modemSlot, unsigned long maxWaitMs) {
+  unsigned long begin = millis();
+  while (millis() - begin < maxWaitMs) {
+    String resp = sendATCommand(modemSlot, "AT+CEREG?", 2000);
+    if (resp.indexOf("+CEREG:") >= 0) {
+      if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) return true;
+      if (resp.indexOf(",3") >= 0) return false;
     }
+    delay(500);
   }
   return false;
 }
@@ -2536,13 +2666,18 @@ void setup() {
   delay(1500);  // 等 USB CDC 稳定
 
   // 模组串口（UART）
-  Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
-  Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);
+  modem1.begin(115200, SERIAL_8N1, MODEM1_RXD, MODEM1_TXD);
+  modem2.begin(115200, SERIAL_8N1, MODEM2_RXD, MODEM2_TXD);
+  modem1.setRxBufferSize(SERIAL_BUFFER_SIZE);
+  modem2.setRxBufferSize(SERIAL_BUFFER_SIZE);
 
   // 模组从“干净状态”启动（EN 断电重启 + 清串口噪声）
-  while (Serial1.available()) Serial1.read();
-  modemPowerCycle();
-  while (Serial1.available()) Serial1.read();
+  for (int slot = 1; slot <= MODEM_COUNT; slot++) {
+    HardwareSerial* modem = getModemBySlot(slot);
+    while (modem->available()) modem->read();
+    modemPowerCycle(slot);
+    while (modem->available()) modem->read();
+  }
   
   // 初始化长短信缓存
   initConcatBuffer();
@@ -2552,40 +2687,42 @@ void setup() {
   configValid = isConfigValid();
   
 
-  // ========== 先初始化模组 ==========
-  while (!sendATandWaitOK("AT", 1000)) {
-    Serial.println("AT未响应，重试...");
-    blink_short();
+  // ========== 初始化两个模组 ==========
+  for (int slot = 1; slot <= MODEM_COUNT; slot++) {
+    bool atReady = false;
+    for (int i = 0; i < 8; i++) {
+      if (sendATandWaitOK(slot, "AT", 1200)) {
+        atReady = true;
+        break;
+      }
+      Serial.println(modemTag(slot) + " AT未响应，重试...");
+      blink_short(200);
+    }
+
+    if (!atReady) {
+      modemOnline[slot - 1] = false;
+      Serial.println(modemTag(slot) + " 初始化失败，标记离线并继续");
+      continue;
+    }
+
+    bool basicInitOk = true;
+    basicInitOk = basicInitOk && sendATandWaitOK(slot, "AT+CGACT=0,1", 5000);
+    basicInitOk = basicInitOk && sendATandWaitOK(slot, "AT+CNMI=2,2,0,0,0", 1200);
+    basicInitOk = basicInitOk && sendATandWaitOK(slot, "AT+CMGF=0", 1200);
+
+    if (!basicInitOk) {
+      modemOnline[slot - 1] = false;
+      Serial.println(modemTag(slot) + " 基础参数初始化失败，标记离线并继续");
+      continue;
+    }
+
+    modemOnline[slot - 1] = waitCEREG(slot, 20000);
+    if (modemOnline[slot - 1]) {
+      Serial.println(modemTag(slot) + " 网络已注册，初始化完成");
+    } else {
+      Serial.println(modemTag(slot) + " 网络注册超时，仍可继续等待后续恢复");
+    }
   }
-  Serial.println("模组AT响应正常");
-  
-  //先设置CGACT，禁用数据连接
-  while (!sendATandWaitOK("AT+CGACT=0,1", 5000)) {
-    Serial.println("设置CGACT失败，重试...");
-    blink_short();
-  }
-  Serial.println("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗");
-  
-  //设置短信自动上报
-  while (!sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000)) {
-    Serial.println("设置CNMI失败，重试...");
-    blink_short();
-  }
-  Serial.println("CNMI参数设置完成");
-  
-  //配置PDU模式
-  while (!sendATandWaitOK("AT+CMGF=0", 1000)) {
-    Serial.println("设置PDU模式失败，重试...");
-    blink_short();
-  }
-  Serial.println("PDU模式设置完成");
-  
-  //等待网络注册（LTE/4G）
-  while (!waitCEREG()) {
-    Serial.println("等待网络注册...");
-    blink_short();
-  }
-  Serial.println("网络已注册");
   // ========== 模组初始化完成 ==========
   
   // 扫描所有信道以连接信号最强的 AP，防止在 mesh 组网这类场景中连接到弱 AP
@@ -2659,7 +2796,9 @@ void loop() {
   checkConcatTimeout();
   
   // 本地透传
-  if (Serial.available()) Serial1.write(Serial.read());
-  // 检查URC和解析
-  checkSerial1URC();
+  if (Serial.available()) modem1.write(Serial.read());
+
+  // 检查URC和解析（双卡）
+  checkModemURC(1);
+  checkModemURC(2);
 }
