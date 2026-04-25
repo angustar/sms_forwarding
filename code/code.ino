@@ -55,6 +55,12 @@ enum PushType {
 // 最大推送通道数
 #define MAX_PUSH_CHANNELS 5
 
+enum AutoRestartMode {
+  AUTO_RESTART_DAILY = 1,
+  AUTO_RESTART_WEEKLY = 2,
+  AUTO_RESTART_MONTHLY = 3
+};
+
 // 推送通道配置（通用设计，支持多种推送方式）
 struct PushChannel {
   bool enabled;           // 是否启用
@@ -78,6 +84,12 @@ struct Config {
   String webUser;      // Web管理账号
   String webPass;      // Web管理密码
   String numberBlackList;  // 号码黑名单（换行符分隔）
+  bool autoRestartEnabled;   // 是否启用定时重启
+  uint8_t autoRestartMode;   // 1=每天 2=每周 3=每月
+  uint8_t autoRestartHour;   // 小时(0-23)
+  uint8_t autoRestartMinute; // 分钟(0-59)
+  uint8_t autoRestartWeekday;  // 周几(1-7, 1=周一)
+  uint8_t autoRestartMonthday; // 每月几号(1-31)
 };
 
 // 默认Web管理账号密码
@@ -100,6 +112,7 @@ bool modemOnline[MODEM_COUNT] = {false, false};
 bool configValid = false;  // 配置是否有效
 bool timeSynced = false;   // NTP时间是否已同步
 unsigned long lastPrintTime = 0;  // 上次打印IP的时间
+String lastAutoRestartDateKey = "";
 
 #define SERIAL_BUFFER_SIZE 500
 #define MAX_PDU_LENGTH 300
@@ -144,6 +157,12 @@ void saveConfig() {
   preferences.putString("webUser", config.webUser);
   preferences.putString("webPass", config.webPass);
   preferences.putString("numBlkList", config.numberBlackList);
+  preferences.putBool("autoRstEn", config.autoRestartEnabled);
+  preferences.putUChar("autoRstMode", config.autoRestartMode);
+  preferences.putUChar("autoRstHour", config.autoRestartHour);
+  preferences.putUChar("autoRstMin", config.autoRestartMinute);
+  preferences.putUChar("autoRstWday", config.autoRestartWeekday);
+  preferences.putUChar("autoRstMday", config.autoRestartMonthday);
   
   // 保存推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
@@ -173,6 +192,18 @@ void loadConfig() {
   config.webUser = preferences.getString("webUser", DEFAULT_WEB_USER);
   config.webPass = preferences.getString("webPass", DEFAULT_WEB_PASS);
   config.numberBlackList = preferences.getString("numBlkList", "");
+  config.autoRestartEnabled = preferences.getBool("autoRstEn", false);
+  config.autoRestartMode = preferences.getUChar("autoRstMode", AUTO_RESTART_DAILY);
+  config.autoRestartHour = preferences.getUChar("autoRstHour", 4);
+  config.autoRestartMinute = preferences.getUChar("autoRstMin", 0);
+  config.autoRestartWeekday = preferences.getUChar("autoRstWday", 1);
+  config.autoRestartMonthday = preferences.getUChar("autoRstMday", 1);
+  if (config.autoRestartMode < AUTO_RESTART_DAILY || config.autoRestartMode > AUTO_RESTART_MONTHLY) config.autoRestartMode = AUTO_RESTART_DAILY;
+  if (config.autoRestartHour > 23) config.autoRestartHour = 4;
+  if (config.autoRestartMinute > 59) config.autoRestartMinute = 0;
+  if (config.autoRestartWeekday < 1 || config.autoRestartWeekday > 7) config.autoRestartWeekday = 1;
+  if (config.autoRestartMonthday < 1 || config.autoRestartMonthday > 31) config.autoRestartMonthday = 1;
+  lastAutoRestartDateKey = preferences.getString("autoRstKey", "");
   
   // 加载推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
@@ -247,6 +278,64 @@ String getDeviceUrl() {
   return "http://" + WiFi.localIP().toString() + "/";
 }
 
+String getTodayKey(struct tm* nowTm) {
+  char keyBuf[16];
+  snprintf(keyBuf, sizeof(keyBuf), "%04d%02d%02d", nowTm->tm_year + 1900, nowTm->tm_mon + 1, nowTm->tm_mday);
+  return String(keyBuf);
+}
+
+void saveAutoRestartKey(const String& key) {
+  preferences.begin("sms_config", false);
+  preferences.putString("autoRstKey", key);
+  preferences.end();
+}
+
+bool isAutoRestartTimeMatched(struct tm* nowTm) {
+  bool dayMatched = false;
+
+  if (config.autoRestartMode == AUTO_RESTART_DAILY) {
+    dayMatched = true;
+  } else if (config.autoRestartMode == AUTO_RESTART_WEEKLY) {
+    int weekday = nowTm->tm_wday;
+    if (weekday == 0) weekday = 7;
+    dayMatched = (uint8_t)weekday == config.autoRestartWeekday;
+  } else if (config.autoRestartMode == AUTO_RESTART_MONTHLY) {
+    dayMatched = (uint8_t)nowTm->tm_mday == config.autoRestartMonthday;
+  }
+
+  if (!dayMatched) return false;
+
+  int nowMinutes = nowTm->tm_hour * 60 + nowTm->tm_min;
+  int targetMinutes = (int)config.autoRestartHour * 60 + (int)config.autoRestartMinute;
+  return nowMinutes >= targetMinutes;
+}
+
+void checkAutoRestartSchedule() {
+  if (!config.autoRestartEnabled || !timeSynced) return;
+
+  time_t now = time(nullptr);
+  if (now < 100000) return;
+
+  struct tm nowTm;
+  gmtime_r(&now, &nowTm);
+
+  if (!isAutoRestartTimeMatched(&nowTm)) return;
+
+  String todayKey = getTodayKey(&nowTm);
+  if (todayKey == lastAutoRestartDateKey) return;
+
+  lastAutoRestartDateKey = todayKey;
+  saveAutoRestartKey(todayKey);
+
+  String modeLabel = "每天";
+  if (config.autoRestartMode == AUTO_RESTART_WEEKLY) modeLabel = "每周";
+  if (config.autoRestartMode == AUTO_RESTART_MONTHLY) modeLabel = "每月";
+
+  Serial.println("⏰ 触发定时重启，模式: " + modeLabel + "，时间: " + String(config.autoRestartHour) + ":" + String(config.autoRestartMinute));
+  delay(300);
+  ESP.restart();
+}
+
 // HTML配置页面
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
@@ -256,33 +345,200 @@ const char* htmlPage = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>短信转发配置</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-    .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; text-align: center; }
-    .form-group { margin-bottom: 15px; }
-    label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-    input[type="text"], input[type="password"], input[type="number"], textarea, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-    textarea { resize: vertical; min-height: 80px; }
-    button { width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-    button:hover { background: #45a049; }
-    .label-inline { display:inline; font-weight:normal; margin-left: 5px; }
-    .btn-send { background: #2196F3; }
-    .btn-send:hover { background: #1976D2; }
-    .section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
-    .section-title { font-size: 18px; color: #333; margin-bottom: 10px; }
-    .status { padding: 10px; background: #e7f3fe; border-left: 4px solid #2196F3; margin-bottom: 20px; }
-    .warning { padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; margin-bottom: 20px; font-size: 12px; }
-    .hint { font-size: 12px; color: #888; }
-    .nav { display: flex; gap: 10px; margin-bottom: 20px; }
-    .nav a { flex: 1; text-align: center; padding: 10px; background: #eee; border-radius: 5px; text-decoration: none; color: #333; }
-    .nav a.active { background: #4CAF50; color: white; }
-    .push-channel { border: 1px solid #e0e0e0; padding: 12px; margin-bottom: 15px; border-radius: 5px; background: #fafafa; }
+    :root {
+      --bg-a: #0f172a;
+      --bg-b: #11324d;
+      --panel: #f8fafc;
+      --ink: #0b1724;
+      --sub: #4b5f72;
+      --line: #d5dde5;
+      --brand: #0ea5a4;
+      --brand-2: #0284c7;
+      --warn-bg: #fff4da;
+      --warn-line: #f59e0b;
+      --ok-bg: #eaf6ff;
+      --ok-line: #0284c7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Noto Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      margin: 0;
+      padding: 24px 14px 28px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 8%, rgba(14,165,164,.28) 0, transparent 28%),
+        radial-gradient(circle at 92% 12%, rgba(2,132,199,.22) 0, transparent 26%),
+        linear-gradient(140deg, var(--bg-a), var(--bg-b));
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 940px;
+      margin: 0 auto;
+      background: linear-gradient(180deg, #ffffff 0%, var(--panel) 100%);
+      padding: 22px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.35);
+      box-shadow: 0 18px 40px rgba(9,20,33,.35);
+      animation: enter .32s ease-out;
+    }
+    @keyframes enter {
+      from { transform: translateY(8px); opacity: .2; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    h1 {
+      margin: 4px 0 18px;
+      color: #08263d;
+      font-size: 30px;
+      letter-spacing: .5px;
+      text-align: center;
+      text-shadow: 0 1px 0 rgba(255,255,255,.45);
+    }
+    .form-group { margin-bottom: 14px; }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 700;
+      color: #12324c;
+      font-size: 13px;
+      letter-spacing: .2px;
+    }
+    input[type="text"], input[type="password"], input[type="number"], textarea, select {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #fff;
+      color: var(--ink);
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, textarea:focus, select:focus {
+      border-color: #7dd3fc;
+      box-shadow: 0 0 0 3px rgba(2,132,199,.16);
+    }
+    textarea { resize: vertical; min-height: 90px; }
+    button {
+      width: 100%;
+      padding: 13px;
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      color: #fff;
+      border: 0;
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: .5px;
+      margin-top: 10px;
+      box-shadow: 0 10px 18px rgba(2,132,199,.24);
+      transition: transform .15s ease, filter .15s ease;
+    }
+    button:hover { transform: translateY(-1px); filter: saturate(1.08); }
+    .label-inline { display:inline; font-weight: 600; margin-left: 6px; }
+    .section {
+      border: 1px solid #dbe6ee;
+      padding: 16px;
+      margin-bottom: 16px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #ffffff, #f7fbff);
+    }
+    .section-title {
+      font-size: 17px;
+      color: #0e3554;
+      margin-bottom: 11px;
+      font-weight: 800;
+    }
+    .status {
+      padding: 11px 12px;
+      background: var(--ok-bg);
+      border-left: 4px solid var(--ok-line);
+      border-radius: 9px;
+      margin-bottom: 16px;
+      color: #0d416a;
+      font-weight: 600;
+    }
+    .warning {
+      padding: 11px;
+      background: var(--warn-bg);
+      border-left: 4px solid var(--warn-line);
+      border-radius: 9px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: #7b4d00;
+      line-height: 1.45;
+    }
+    .hint { font-size: 12px; color: var(--sub); line-height: 1.45; }
+    .nav {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      background: #eef3f8;
+      border: 1px solid #dbe4ec;
+      padding: 6px;
+      border-radius: 12px;
+    }
+    .nav a {
+      flex: 1;
+      text-align: center;
+      padding: 10px;
+      border-radius: 9px;
+      text-decoration: none;
+      color: #244863;
+      font-weight: 700;
+      transition: background .2s, color .2s;
+    }
+    .nav a.active {
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      color: #fff;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.2);
+    }
+    .push-channel {
+      border: 1px solid #d6e4ef;
+      padding: 12px;
+      margin-bottom: 14px;
+      border-radius: 12px;
+      background: #fbfdff;
+      transition: box-shadow .2s ease, border-color .2s ease;
+    }
+    .push-channel.enabled {
+      border-color: #7dd3fc;
+      box-shadow: 0 8px 20px rgba(2,132,199,.12);
+      background: #f5fbff;
+    }
     .push-channel-header { display: flex; align-items: center; margin-bottom: 10px; }
-    .push-channel-header input[type="checkbox"] { width: auto; margin-right: 8px; }
-    .push-channel-header label { margin: 0; font-weight: bold; }
+    .push-channel-header input[type="checkbox"] { width: auto; margin-right: 8px; accent-color: #0284c7; }
+    .push-channel-header label { margin: 0; font-weight: 700; }
     .push-channel-body { display: none; }
     .push-channel.enabled .push-channel-body { display: block; }
-    .push-type-hint { font-size: 11px; color: #666; margin-top: 5px; padding: 8px; background: #f0f0f0; border-radius: 3px; }
+    .push-type-hint {
+      font-size: 11px;
+      color: #2f5778;
+      margin-top: 7px;
+      padding: 8px;
+      background: #eaf5ff;
+      border: 1px solid #cde7fb;
+      border-radius: 8px;
+      line-height: 1.4;
+    }
+    .inline-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .restart-box {
+      border: 1px solid #d6e4ef;
+      border-radius: 12px;
+      background: #fbfdff;
+      padding: 12px;
+    }
+    @media (max-width: 760px) {
+      body { padding: 14px 10px 16px; }
+      .container { padding: 14px; border-radius: 14px; }
+      h1 { font-size: 24px; margin-bottom: 12px; }
+      .section { padding: 13px; border-radius: 12px; }
+      .nav { gap: 6px; }
+      .nav a { padding: 9px 6px; font-size: 13px; }
+      .inline-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -345,6 +601,53 @@ const char* htmlPage = R"rawliteral(
         <div class="form-group">
           <label>管理员手机号</label>
           <input type="text" name="adminPhone" value="%ADMIN_PHONE%" placeholder="13800138000">
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">⏰ 定时重启设置</div>
+        <div class="hint" style="margin-bottom:12px;">用于定期重启系统，降低长时间运行导致异常的概率。当前使用 UTC 时间，建议根据你的时区换算后填写。</div>
+        <div class="restart-box">
+          <div class="form-group" style="margin-bottom:10px;">
+            <input type="checkbox" name="autoRestartEnabled" id="autoRestartEnabled" %AUTO_RESTART_ENABLED% onchange="toggleAutoRestart()" style="width:auto;vertical-align:middle;">
+            <label for="autoRestartEnabled" class="label-inline">启用定时重启</label>
+          </div>
+          <div id="autoRestartPanel" style="display:none;">
+            <div class="form-group">
+              <label>周期</label>
+              <select name="autoRestartMode" id="autoRestartMode" onchange="updateAutoRestartMode()">
+                <option value="1" %AUTO_RESTART_MODE_DAILY%>每天</option>
+                <option value="2" %AUTO_RESTART_MODE_WEEKLY%>每周</option>
+                <option value="3" %AUTO_RESTART_MODE_MONTHLY%>每月</option>
+              </select>
+            </div>
+            <div class="inline-grid">
+              <div class="form-group">
+                <label>小时（0-23）</label>
+                <input type="number" name="autoRestartHour" min="0" max="23" value="%AUTO_RESTART_HOUR%">
+              </div>
+              <div class="form-group">
+                <label>分钟（0-59）</label>
+                <input type="number" name="autoRestartMinute" min="0" max="59" value="%AUTO_RESTART_MINUTE%">
+              </div>
+            </div>
+            <div class="form-group" id="autoRestartWeeklyRow" style="display:none;">
+              <label>每周几执行</label>
+              <select name="autoRestartWeekday">
+                <option value="1" %AUTO_RESTART_WEEKDAY_1%>周一</option>
+                <option value="2" %AUTO_RESTART_WEEKDAY_2%>周二</option>
+                <option value="3" %AUTO_RESTART_WEEKDAY_3%>周三</option>
+                <option value="4" %AUTO_RESTART_WEEKDAY_4%>周四</option>
+                <option value="5" %AUTO_RESTART_WEEKDAY_5%>周五</option>
+                <option value="6" %AUTO_RESTART_WEEKDAY_6%>周六</option>
+                <option value="7" %AUTO_RESTART_WEEKDAY_7%>周日</option>
+              </select>
+            </div>
+            <div class="form-group" id="autoRestartMonthlyRow" style="display:none;">
+              <label>每月几号执行（1-31）</label>
+              <input type="number" name="autoRestartMonthday" min="1" max="31" value="%AUTO_RESTART_MONTHDAY%">
+            </div>
+          </div>
         </div>
       </div>
       
@@ -434,11 +737,25 @@ const char* htmlPage = R"rawliteral(
         document.getElementById('key2' + idx).placeholder = '12345678:ABC...';
       }
     }
+    function toggleAutoRestart() {
+      var cb = document.getElementById('autoRestartEnabled');
+      var panel = document.getElementById('autoRestartPanel');
+      panel.style.display = cb.checked ? 'block' : 'none';
+      if (cb.checked) {
+        updateAutoRestartMode();
+      }
+    }
+    function updateAutoRestartMode() {
+      var mode = parseInt(document.getElementById('autoRestartMode').value);
+      document.getElementById('autoRestartWeeklyRow').style.display = (mode == 2) ? 'block' : 'none';
+      document.getElementById('autoRestartMonthlyRow').style.display = (mode == 3) ? 'block' : 'none';
+    }
     document.addEventListener('DOMContentLoaded', function() {
       for (var i = 0; i < 5; i++) {
         toggleChannel(i);
         updateTypeHint(i);
       }
+      toggleAutoRestart();
     });
   </script>
 </body>
@@ -454,44 +771,182 @@ const char* htmlToolsPage = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>工具箱</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-    .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-    h1 { color: #333; text-align: center; }
-    .form-group { margin-bottom: 15px; }
-    label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-    input[type="text"], textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+    :root {
+      --bg-a: #091b2f;
+      --bg-b: #16314a;
+      --panel: #f8fafc;
+      --ink: #0a1724;
+      --sub: #526779;
+      --line: #d9e2ea;
+      --brand: #0ea5a4;
+      --brand-2: #0284c7;
+      --query: #0f766e;
+      --ping: #ea580c;
+      --ctrl: #475569;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Noto Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      margin: 0;
+      padding: 24px 14px 28px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 82% 6%, rgba(14,165,164,.2), transparent 34%),
+        radial-gradient(circle at 10% 92%, rgba(234,88,12,.16), transparent 32%),
+        linear-gradient(150deg, var(--bg-a), var(--bg-b));
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 940px;
+      margin: 0 auto;
+      background: linear-gradient(180deg, #ffffff, var(--panel));
+      padding: 22px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,.35);
+      box-shadow: 0 18px 40px rgba(8,19,33,.35);
+      animation: enter .32s ease-out;
+    }
+    @keyframes enter {
+      from { transform: translateY(8px); opacity: .2; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    h1 {
+      margin: 4px 0 18px;
+      text-align: center;
+      color: #08263d;
+      font-size: 30px;
+      letter-spacing: .5px;
+    }
+    .form-group { margin-bottom: 14px; }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 700;
+      color: #11324d;
+      font-size: 13px;
+      letter-spacing: .2px;
+    }
+    input[type="text"], textarea, select {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #fff;
+      color: var(--ink);
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    input[type="text"]:focus, textarea:focus, select:focus {
+      border-color: #7dd3fc;
+      box-shadow: 0 0 0 3px rgba(2,132,199,.16);
+    }
     textarea { resize: vertical; min-height: 100px; }
-    button { width: 100%; padding: 12px; background: #2196F3; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-    button:hover { background: #1976D2; }
-    .btn-query { background: #9C27B0; }
-    .btn-query:hover { background: #7B1FA2; }
-    .btn-ping { background: #FF9800; }
-    .btn-ping:hover { background: #F57C00; }
-    .btn-info { background: #607D8B; }
-    .btn-info:hover { background: #455A64; }
-    button:disabled { background: #ccc; cursor: not-allowed; }
-    .section { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
-    .section-title { font-size: 18px; color: #333; margin-bottom: 10px; }
-    .status { padding: 10px; background: #e7f3fe; border-left: 4px solid #2196F3; margin-bottom: 20px; }
-    .nav { display: flex; gap: 10px; margin-bottom: 20px; }
-    .nav a { flex: 1; text-align: center; padding: 10px; background: #eee; border-radius: 5px; text-decoration: none; color: #333; }
-    .nav a.active { background: #2196F3; color: white; }
-    .char-count { font-size: 12px; color: #888; text-align: right; }
-    .hint { font-size: 12px; color: #888; margin-top: 5px; }
-    .result-box { margin-top: 10px; padding: 10px; border-radius: 5px; display: none; }
-    .result-success { background: #e8f5e9; border-left: 4px solid #4CAF50; color: #2e7d32; }
-    .result-error { background: #ffebee; border-left: 4px solid #f44336; color: #c62828; }
-    .result-loading { background: #fff3e0; border-left: 4px solid #FF9800; color: #e65100; }
-    .result-info { background: #e3f2fd; border-left: 4px solid #2196F3; color: #1565c0; }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      color: #fff;
+      border: none;
+      border-radius: 11px;
+      cursor: pointer;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: .4px;
+      margin-top: 10px;
+      box-shadow: 0 10px 18px rgba(2,132,199,.2);
+      transition: transform .15s ease, filter .15s ease;
+    }
+    button:hover { transform: translateY(-1px); filter: saturate(1.08); }
+    .btn-query { background: linear-gradient(90deg, #0f766e, #0ea5a4); }
+    .btn-ping { background: linear-gradient(90deg, #ea580c, #fb923c); }
+    .btn-info { background: linear-gradient(90deg, #475569, #64748b); }
+    button:disabled { background: #c7d0d9; box-shadow: none; cursor: not-allowed; }
+    .section {
+      border: 1px solid #dbe6ee;
+      padding: 16px;
+      margin-bottom: 16px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #ffffff, #f7fbff);
+    }
+    .section-title {
+      font-size: 17px;
+      color: #0d3554;
+      margin-bottom: 10px;
+      font-weight: 800;
+    }
+    .status {
+      padding: 11px 12px;
+      background: #eaf6ff;
+      border-left: 4px solid #0284c7;
+      border-radius: 9px;
+      margin-bottom: 16px;
+      color: #0d416a;
+      font-weight: 600;
+    }
+    .nav {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      background: #eef3f8;
+      border: 1px solid #dbe4ec;
+      padding: 6px;
+      border-radius: 12px;
+    }
+    .nav a {
+      flex: 1;
+      text-align: center;
+      padding: 10px;
+      background: transparent;
+      border-radius: 9px;
+      text-decoration: none;
+      color: #244863;
+      font-weight: 700;
+    }
+    .nav a.active {
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      color: #fff;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.2);
+    }
+    .char-count { font-size: 12px; color: var(--sub); text-align: right; }
+    .hint { font-size: 12px; color: var(--sub); margin-top: 6px; line-height: 1.4; }
+    .result-box { margin-top: 10px; padding: 11px; border-radius: 9px; display: none; line-height: 1.45; }
+    .result-success { background: #e8f5e9; border-left: 4px solid #16a34a; color: #14532d; }
+    .result-error { background: #ffebee; border-left: 4px solid #ef4444; color: #991b1b; }
+    .result-loading { background: #fff3e0; border-left: 4px solid #f97316; color: #9a3412; }
+    .result-info { background: #e3f2fd; border-left: 4px solid #0284c7; color: #0c4a6e; }
     .info-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    .info-table td { padding: 5px 8px; border-bottom: 1px solid #ddd; }
-    .info-table td:first-child { font-weight: bold; width: 40%; color: #555; }
+    .info-table td { padding: 6px 8px; border-bottom: 1px solid #dbe6ef; }
+    .info-table td:first-child { font-weight: 700; width: 40%; color: #334d63; }
     .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
     .btn-group button { flex: 1; min-width: 120px; }
-    #atLog { background: #333; color: #00ff00; font-family: 'Courier New', Courier, monospace; min-height: 150px; max-height: 300px; overflow-y: auto; padding: 10px; border-radius: 5px; margin-bottom: 10px; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    #atLog {
+      background: #0f172a;
+      color: #93f4ff;
+      border: 1px solid #1e293b;
+      font-family: Consolas, "Courier New", monospace;
+      min-height: 160px;
+      max-height: 300px;
+      overflow-y: auto;
+      padding: 10px;
+      border-radius: 10px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.04);
+    }
     .at-input-group { display: flex; gap: 10px; }
-    .at-input-group input { flex: 1; font-family: monospace; }
+    .at-input-group input { flex: 1; font-family: Consolas, "Courier New", monospace; }
     .at-input-group button { width: auto; min-width: 80px; margin-top: 0; }
+    @media (max-width: 760px) {
+      body { padding: 14px 10px 16px; }
+      .container { padding: 14px; border-radius: 14px; }
+      h1 { font-size: 24px; margin-bottom: 12px; }
+      .section { padding: 13px; border-radius: 12px; }
+      .btn-group button { min-width: 100%; }
+      .at-input-group { flex-direction: column; }
+      .at-input-group button { width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -813,6 +1268,20 @@ void handleRoot() {
   html.replace("%SMTP_SEND_TO%", config.smtpSendTo);
   html.replace("%ADMIN_PHONE%", config.adminPhone);
   html.replace("%NUMBER_BLACK_LIST%", config.numberBlackList);
+  html.replace("%AUTO_RESTART_ENABLED%", config.autoRestartEnabled ? "checked" : "");
+  html.replace("%AUTO_RESTART_MODE_DAILY%", config.autoRestartMode == AUTO_RESTART_DAILY ? "selected" : "");
+  html.replace("%AUTO_RESTART_MODE_WEEKLY%", config.autoRestartMode == AUTO_RESTART_WEEKLY ? "selected" : "");
+  html.replace("%AUTO_RESTART_MODE_MONTHLY%", config.autoRestartMode == AUTO_RESTART_MONTHLY ? "selected" : "");
+  html.replace("%AUTO_RESTART_HOUR%", String(config.autoRestartHour));
+  html.replace("%AUTO_RESTART_MINUTE%", String(config.autoRestartMinute));
+  html.replace("%AUTO_RESTART_MONTHDAY%", String(config.autoRestartMonthday));
+  html.replace("%AUTO_RESTART_WEEKDAY_1%", config.autoRestartWeekday == 1 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_2%", config.autoRestartWeekday == 2 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_3%", config.autoRestartWeekday == 3 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_4%", config.autoRestartWeekday == 4 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_5%", config.autoRestartWeekday == 5 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_6%", config.autoRestartWeekday == 6 ? "selected" : "");
+  html.replace("%AUTO_RESTART_WEEKDAY_7%", config.autoRestartWeekday == 7 ? "selected" : "");
   
   // 生成推送通道HTML
   String channelsHtml = "";
@@ -1649,6 +2118,21 @@ void handleSave() {
   config.smtpSendTo = server.arg("smtpSendTo");
   config.adminPhone = server.arg("adminPhone");
   config.numberBlackList = server.arg("numberBlackList");
+  config.autoRestartEnabled = server.arg("autoRestartEnabled") == "on";
+  config.autoRestartMode = (uint8_t)server.arg("autoRestartMode").toInt();
+  if (config.autoRestartMode < AUTO_RESTART_DAILY || config.autoRestartMode > AUTO_RESTART_MONTHLY) config.autoRestartMode = AUTO_RESTART_DAILY;
+  int rstHour = server.arg("autoRestartHour").toInt();
+  int rstMinute = server.arg("autoRestartMinute").toInt();
+  int rstWeekday = server.arg("autoRestartWeekday").toInt();
+  int rstMonthday = server.arg("autoRestartMonthday").toInt();
+  if (rstHour < 0 || rstHour > 23) rstHour = 4;
+  if (rstMinute < 0 || rstMinute > 59) rstMinute = 0;
+  if (rstWeekday < 1 || rstWeekday > 7) rstWeekday = 1;
+  if (rstMonthday < 1 || rstMonthday > 31) rstMonthday = 1;
+  config.autoRestartHour = (uint8_t)rstHour;
+  config.autoRestartMinute = (uint8_t)rstMinute;
+  config.autoRestartWeekday = (uint8_t)rstWeekday;
+  config.autoRestartMonthday = (uint8_t)rstMonthday;
   
   // 保存推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
@@ -2730,6 +3214,7 @@ void setup() {
   // 连接WiFi（支持隐藏SSID）
   // 参数: ssid, password, channel(0=自动), bssid(nullptr=自动), connect(true=连接隐藏网络)
   WiFi.begin(WIFI_SSID, WIFI_PASS, 0, nullptr, true);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.println("连接wifi");
   Serial.println(WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) blink_short();
@@ -2783,6 +3268,9 @@ void setup() {
 void loop() {
   // 处理HTTP请求
   server.handleClient();
+
+  // 定时重启调度检查
+  checkAutoRestartSchedule();
   
   // 如果配置无效，每秒打印一次IP地址
   if (!configValid) {
